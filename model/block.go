@@ -3,7 +3,6 @@ package model
 import (
 	"errors"
 	"go-metering/database"
-	"gorm.io/gorm"
 	"github.com/lib/pq"
 	"encoding/json"
 	"crypto/sha256"
@@ -12,16 +11,23 @@ import (
 )
 
 type Block struct {
-    BlockHash     string  				`gorm:"primaryKey;size:64;not null" json:"block_hash"`
-    BlockType     string  				`gorm:"size:64;not null;index;uniqueIndex:idx_blocks_one_genesis,where: block_type = 'genesis'" json:"block_type"`
-    PreviousHash  string  				`gorm:"size:64;uniqueIndex;default:null" json:"previous_hash"`
-    LinkedHash    string  				`gorm:"size:64;index;uniqueIndex:idx_blocks_account_linkedhash;default:null" json:"linked_hash"`
-    Account       string  				`gorm:"size:64;not null;index;uniqueIndex:idx_blocks_account_linkedhash" json:"account_id"`
-    Receivers     pq.StringArray  `gorm:"type:varchar(64)[];index:,type:gin;default:null" json:"receiver_ids"`
-    Amount        uint64  				`json:"amount;default:0"`
-    Balance       uint64  				`json:"balance;default:0"`
-    Signature     string  				`gorm:"not null" json:"signature"`
-    Timestamp     uint32  				`gorm:"autoCreateTime" json:"timestamp"`
+    BlockHash     string  	`json:"block_hash"`
+    BlockType     string  	`json:"block_type"`
+    PreviousHash  string  	`json:"previous_hash"`
+    LinkedHash    string  	`json:"linked_hash"`
+    Account       string  	`json:"account_id"`
+    Receivers     []string  `json:"receiver_ids"`
+    Amount        uint64  	`json:"amount;default:0"`
+    Balance       uint64  	`json:"balance;default:0"`
+    Signature     string  	`json:"signature"`
+    Timestamp     uint32  	`json:"timestamp"`
+}
+
+type BlockIndex struct {
+	Unique			bool
+	Name    		string
+	KeyDerivation 	func(*Block) string
+	ValueDerivation func(*Block) *Block
 }
 
 func calculateBlockHash(block *Block) ([32]byte, error) {
@@ -49,14 +55,146 @@ func calculateBlockHash(block *Block) ([32]byte, error) {
 	return sha256.Sum256(bytes), nil
 }
 
-func (block *Block) Save(tx *gorm.DB) (*Block, error) {
-	if tx == nil {
-		tx = database.Database
-	}
-	err := tx.Create(&block).Error
+func (block *Block) PreviousBlock() (*Block, error) {
+	value, closer, err := db.Get(block.PreviousHash)
 	if err != nil {
 		return &Block{}, err
 	}
+	closer.Close()
+
+	return value, nil
+}
+
+func (block *Block) LinkedBlock() (*Block, error) {
+	value, closer, err := db.Get(block.LinkedHash)
+	if err != nil {
+		return &Block{}, err
+	}
+	closer.Close()
+	
+	return value, nil
+}
+
+func (block *Block) indexes() ([]BlockIndex) {
+	var indices []BlockIndex
+	switch blockType := block.BlockType; blockType {
+	case "genesis":
+		indices = append(indices, BlockIndex{
+			// ensure there is only one genesis type block
+			Unique: true,
+			Name: "single_genesis"
+			KeyDerivation: func(block *Block) string {
+				return block.BlockType
+			},
+			ValueDerivation: func(block *Block) *Block {
+				return block
+			}
+		}, BlockIndex{
+			// genesis block should surface in account blocks
+			Unique: false
+			Name: "account_blocks"
+			KeyDerivation: func(block *Block) string {
+				return block.Account
+			},
+			ValueDerivation: func(block *Block) *Block {
+				return block
+			}
+		})
+	case "account_create":
+		indices = indices.append(BlockIndex{
+			Unique: false
+			Name: "account_blocks"
+			KeyDerivation: func(block *Block) string {
+				return block.Account
+			},
+			ValueDerivation: func(block *Block) *Block {
+				return block
+			}
+		})
+	case "recieve":
+		indices = indices.append(BlockIndex{
+			Unique: true
+			Name: "receive_account_linked_hash"
+			KeyDerivation: func(block *Block) string {
+				return block.Account + ":" + block.LinkedHash
+			},
+			ValueDerivation: func(block *Block) *Block {
+				return block.LinkedBlock
+			}
+		}, BlockIndex{
+			Unique: false
+			Name: "account_blocks"
+			KeyDerivation: func(block *Block) string {
+				return block.Account
+			},
+			ValueDerivation: func(block *Block) *Block {
+				return block
+			}
+		}, BlockIndex{
+			Unique: false
+			Name: "previous_blocks"
+			KeyDerivation: func(block *Block) string {
+				return block.PreviousHash
+			},
+			ValueDerivation: func(block *Block) *Block {
+				return block.PreviousBlock
+			}
+		})
+	case "payout":
+		indices = indices.append(BlockIndex{
+			Unique: false
+			Name: "account_blocks"
+			KeyDerivation: func(block *Block) string {
+				return block.Account
+			}
+		}, BlockIndex{
+			Unique: false
+			Name: "previous_blocks"
+			KeyDerivation: func(block *Block) string {
+				return block.PreviousHash
+			},
+			ValueDerivation: func(block *Block) *Block {
+				return block.PreviousBlock
+			}
+		})
+	}
+
+	return indices
+}
+
+func (block *Block) Save() (*Block, error) {
+	err := database.Database.Set(block.BlockHash, block, database.Sync)
+	if err != nil {
+		return &Block{}, err
+	}
+	// save the indexes
+	for _, index := range indexes(block) {
+		val, closer, err := database.Database.Get(index.KeyDerivation(block))
+		if block.Unique && err == nil {
+			// unique indexes should not exist already and should result in the error
+			closer.Close()
+			return &Block{}, errors.New("failed on unique index violation: " + index.Name)
+		}
+		if err == database.NotFound {
+			// simply write the index
+			closer.Close()
+			err := database.Database.Set(index.KeyDerivation(block), index.ValueDerivation(block), database.Sync)
+			if err != nil {
+				return &Block{}, err
+			}
+		}
+		if err != nil {
+			// return any other errors
+			return &Block{}, err
+		}
+		// append to the value
+		closer.Close()
+		err := database.Database.Set(index.KeyDerivation(block), val.append(index.ValueDerivation(block)), database.Sync)
+		if err != nil {
+			return &Block{}, err
+		}
+	}
+
 	return block, nil
 }
 
@@ -73,7 +211,7 @@ func (block *Block) HashAndSign(privateKey ed25519.PrivateKey) (*Block, error) {
     return block, nil
 }
 
-func genesis(tx *gorm.DB) (ed25519.PublicKey, ed25519.PrivateKey, *Block, error) {
+func genesis() (ed25519.PublicKey, ed25519.PrivateKey, *Block, error) {
 	publicKey, privateKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		panic(err)
@@ -91,7 +229,7 @@ func genesis(tx *gorm.DB) (ed25519.PublicKey, ed25519.PrivateKey, *Block, error)
 		return publicKey, privateKey, &Block{}, err
 	}
 
-	savedBlock, err := signedBlock.Save(tx)
+	savedBlock, err := signedBlock.Save()
 	if err != nil {
 		return publicKey, privateKey, &Block{}, err
 	}
@@ -99,6 +237,12 @@ func genesis(tx *gorm.DB) (ed25519.PublicKey, ed25519.PrivateKey, *Block, error)
 }
 
 func ValidateGenesisBlock(block *Block) (bool) {
+	value, closer, err := db.Get("genesis_block")
+	closer.Close()
+	if err != database.NotFound {
+		return false
+	}
+
 	if !validateHash(block) {
 		return false
 	}
@@ -147,7 +291,7 @@ func validateHash(block *Block) (bool) {
 	return true
 }
 
-func AccountCreate(tx *gorm.DB) (ed25519.PublicKey, ed25519.PrivateKey, *Block, error) {
+func AccountCreate() (ed25519.PublicKey, ed25519.PrivateKey, *Block, error) {
 	publicKey, privateKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		panic(err)
@@ -165,7 +309,7 @@ func AccountCreate(tx *gorm.DB) (ed25519.PublicKey, ed25519.PrivateKey, *Block, 
 		return publicKey, privateKey, &Block{}, err
 	}
 
-	savedBlock, err := signedBlock.Save(tx)
+	savedBlock, err := signedBlock.Save()
 	if err != nil {
 		return publicKey, privateKey, &Block{}, err
 	}
@@ -196,7 +340,7 @@ func ValidateAccountCreateBlock(block *Block) (bool) {
 	return true
 }
 
-func receive(tx *gorm.DB, fromBlock *Block, previousBlock *Block, publicKey ed25519.PublicKey, privateKey ed25519.PrivateKey) (*Block, error) {
+func receive(fromBlock *Block, previousBlock *Block, publicKey ed25519.PublicKey, privateKey ed25519.PrivateKey) (*Block, error) {
 	block := Block{
 		BlockType: "receive",
 		Account: hex.EncodeToString(publicKey),
@@ -211,14 +355,14 @@ func receive(tx *gorm.DB, fromBlock *Block, previousBlock *Block, publicKey ed25
 		return &Block{}, err
 	}
 
-	savedBlock, err := signedBlock.Save(tx)
+	savedBlock, err := signedBlock.Save()
 	if err != nil {
 		return &Block{}, err
 	}
 	return savedBlock, nil
 }
 
-func ValidateReceiveBlock(block *Block, tx *gorm.DB) (bool) {
+func ValidateReceiveBlock(block *Block) (bool) {
 	if !validateHash(block) {
 		return false
 	}
@@ -227,33 +371,25 @@ func ValidateReceiveBlock(block *Block, tx *gorm.DB) (bool) {
 		return false
 	}
 
-	if tx == nil {
-		tx = database.Database
-	}
-
-	var previousBlock Block
-	var linkedBlock Block
-	err := tx.Take(&previousBlock, "block_hash = ?", block.PreviousHash).Error
-	if err != nil {
-		return false
-	}
-	err = tx.Take(&linkedBlock, "block_hash = ?", block.LinkedHash).Error
-	if err != nil {
+	// ensure only one of these exists
+	value, closer, err := db.Get(block.Account + ":" + block.LinkedHash)
+	closer.Close()
+	if err != database.NotFound {
 		return false
 	}
 
-	if block.Amount != linkedBlock.Amount {
+	if block.Amount != block.LinkedBlock.Amount {
 		return false
 	}
 
-	if block.Balance != (block.Amount + previousBlock.Balance) {
+	if block.Balance != (block.Amount + block.PreviousBlock.Balance) {
 		return false
 	}
 
 	return true
 }
 
-func payout(tx *gorm.DB, receivers []ed25519.PublicKey, previousBlock *Block, amount uint64, publicKey ed25519.PublicKey, privateKey ed25519.PrivateKey) (*Block, error) {
+func payout(receivers []ed25519.PublicKey, previousBlock *Block, amount uint64, publicKey ed25519.PublicKey, privateKey ed25519.PrivateKey) (*Block, error) {
 	receiver_ids := make([]string, len(receivers))
 	for i, v := range receivers {
 		receiver_ids[i] = hex.EncodeToString(v)
@@ -273,14 +409,14 @@ func payout(tx *gorm.DB, receivers []ed25519.PublicKey, previousBlock *Block, am
 		return &Block{}, err
 	}
 
-	savedBlock, err := signedBlock.Save(tx)
+	savedBlock, err := signedBlock.Save()
 	if err != nil {
 		return &Block{}, err
 	}
 	return savedBlock, nil
 }
 
-func ValidatePayoutBlock(block *Block, tx *gorm.DB) (bool) {
+func ValidatePayoutBlock(block *Block) (bool) {
 	if !validateHash(block) {
 		return false
 	}
@@ -293,17 +429,11 @@ func ValidatePayoutBlock(block *Block, tx *gorm.DB) (bool) {
 		tx = database.Database
 	}
 
-	var previousBlock Block
-	err := tx.Take(&previousBlock, "block_hash = ?", block.PreviousHash).Error
-	if err != nil {
-		return false
-	}
-
 	if block.Amount <= 0  {
 		return false
 	}
 
-	if block.Balance != (previousBlock.Balance - (uint64(len(block.Receivers)) * block.Amount)) {
+	if block.Balance != (block.PreviousBlock.Balance - (uint64(len(block.Receivers)) * block.Amount)) {
 		return false
 	}
 

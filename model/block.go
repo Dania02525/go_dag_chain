@@ -441,43 +441,41 @@ func ValidatePayoutBlock(block *Block) (bool) {
 }
 
 func InitChain() (error) {
-	return (database.Database.Transaction(func(tx *gorm.DB) error {
-		gpubkey, gpkey, genesisBlock, err := genesis(tx)
-		if err != nil {
-			return err
-		}
+	gpubkey, gpkey, genesisBlock, err := genesis()
+	if err != nil {
+		return err
+	}
 
-		if !ValidateGenesisBlock(genesisBlock) {
-			return errors.New("fail- genesis invalid")
-		}
+	if !ValidateGenesisBlock(genesisBlock) {
+		return errors.New("fail- genesis invalid")
+	}
 
-		pubkey, pkey, createBlock, err := AccountCreate(tx)
-		if err != nil {
-			return err
-		}
+	pubkey, pkey, createBlock, err := AccountCreate()
+	if err != nil {
+		return err
+	}
 
-		if !ValidateAccountCreateBlock(createBlock) {
-			return errors.New("fail- account_create invalid")
-		}
+	if !ValidateAccountCreateBlock(createBlock) {
+		return errors.New("fail- account_create invalid")
+	}
 
-		payoutBlock, err := payout(tx, []ed25519.PublicKey{pubkey}, genesisBlock, uint64(9223372036854775807), gpubkey, gpkey)
-		if err != nil {
-			return err
-		}
+	payoutBlock, err := payout([]ed25519.PublicKey{pubkey}, genesisBlock, uint64(9223372036854775807), gpubkey, gpkey)
+	if err != nil {
+		return err
+	}
 
-		if !ValidatePayoutBlock(payoutBlock, tx) {
-			return errors.New("fail- payout invalid")
-		}
+	if !ValidatePayoutBlock(payoutBlock) {
+		return errors.New("fail- payout invalid")
+	}
 
-		receiveBlock, err := receive(tx, payoutBlock, createBlock, pubkey, pkey)
-		if err != nil {
-			return err
-		}
+	receiveBlock, err := receive(payoutBlock, createBlock, pubkey, pkey)
+	if err != nil {
+		return err
+	}
 
-		if !ValidateReceiveBlock(receiveBlock, tx) {
-			return errors.New("fail- receive invalid")
-		}
+	if !ValidateReceiveBlock(receiveBlock) {
+		return errors.New("fail- receive invalid")
+	}
 
-		return nil
-	}))
+	return nil
 }

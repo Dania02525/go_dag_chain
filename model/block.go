@@ -425,10 +425,6 @@ func ValidatePayoutBlock(block *Block) (bool) {
 		return false
 	}
 
-	if tx == nil {
-		tx = database.Database
-	}
-
 	if block.Amount <= 0  {
 		return false
 	}
